@@ -1,0 +1,253 @@
+'Load foundation inputs and generate snapshots, workflows, and execution observations.'
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+
+from .types import Example, Observation, Snapshot, Task, Workflow
+
+
+SCENARIOS = ("应急救援", "智慧家居", "智慧工厂")
+DIFFICULTIES = ("简单", "中等", "困难")
+
+
+def balanced_hosts(agents, computes, rng):
+    'Map agents evenly to compute nodes with a random permutation.'
+    return rng.permutation(np.arange(agents) % computes).astype(int).tolist()
+
+
+def seed_of(*parts):
+    'Derive a deterministic integer seed from the supplied components.'
+    return int.from_bytes(hashlib.sha256("|".join(map(str, parts)).encode()).digest()[:8], "little")
+
+
+def rounded(x):
+    'Round arrays to five decimal places and return lists.'
+    return np.asarray(x).round(5).tolist()
+
+
+class Foundation:
+    'Load capability records, task templates, and compute-load time series.'
+
+    def __init__(self, root):
+        root = Path(root)
+        self.root = root
+
+        agent_path = root / "agent_capabilities" / "agent_capabilities.json"
+        task_path = root / "tasks/tasks.json"
+        load_path = root / "compute_load/compute_node_load_timeseries.csv"
+        agents = json.loads(agent_path.read_text(encoding="utf-8-sig"))
+        self.tasks = json.loads(task_path.read_text(encoding="utf-8-sig"))
+        self.types = [dict(a, all_skills=[s["id"] for s in a["skills"]]) for a in agents]
+
+        self.skill_requirements = {}
+        for a in agents:
+            for skill in a["skills"]:
+                self.skill_requirements.setdefault(skill["id"], {
+                    "tools": list(skill.get("required_tools", [])),
+                    "knowledge": list(skill.get("required_knowledge", []))})
+
+        by_time = defaultdict(list)
+        with load_path.open(encoding="utf-8-sig", newline="") as handle:
+            for r in csv.DictReader(handle):
+                by_time[int(r["时间戳"])].append([
+                    float(r["GPU算力剩余量(TFLOPS)"]), float(r["内存剩余量(GB)"]),
+                    float(r["显存剩余量(GB)"]), float(r["队列响应时间(ms)"]) / 1000,
+                    float(r["服务器负载率代理"]),
+                ])
+        self.timestamps = sorted(by_time)
+        self.loads = np.asarray([by_time[t] for t in self.timestamps], dtype=np.float32)
+
+        self.partitions = {s: [] for s in ("train", "val", "test")}
+        strata = defaultdict(list)
+        for t in self.tasks:
+            strata[t["场景"], t["难度级别"]].append(t)
+        for items in strata.values():
+            items.sort(key=lambda t: seed_of(t["任务id"], "template-split"))
+            for index, t in enumerate(items):
+                split = "train" if index < len(items) - 2 else "val" if index == len(items) - 2 else "test"
+                self.partitions[split].append(t)
+
+    def bounds(self, split, history=16):
+        'Return split-specific time bounds with a history-length purge gap.'
+
+        n = len(self.timestamps)
+        a, b = int(n * .75), int(n * .875)
+        lo, hi = {"train": (0, a), "val": (a + history, b), "test": (b + history, n)}[split]
+        if hi - lo < history:
+            raise ValueError("insufficient trace timestamps after purging")
+        return lo, hi
+
+    def episode(self, split, index, seed=7, agents=100, computes=None, history=16,
+                scenario=None, difficulty=None, stress="normal", severity=1.0, batch=1):
+        'Generate snapshots, workflows, and observations from the logging policy.'
+        computes = computes or max(2, round(agents / 10))
+        rng = np.random.default_rng(seed_of(seed, split, index, agents, stress, severity))
+        lo, hi = self.bounds(split, history)
+        start = int(rng.integers(lo, hi - history + 1))
+        slots = rng.integers(0, self.loads.shape[1], computes)
+        loads = self.loads[start:start + history, slots].transpose(1, 0, 2).copy()
+
+        loads[:, :, 0] = 20 + 180 * loads[:, :, 0] / 4000
+        loads[:, :, 1] = 64 * np.clip(1 - loads[:, :, 4], .05, .95)
+        loads[:, :, 2] = 32 * np.clip(1 - loads[:, :, 4], .05, .95)
+        loads[:, :, 3] = np.clip(loads[:, :, 3], 0, 20)
+        if stress in ("compute", "combined"):
+
+            ramp = np.linspace(0, min(.8, .35 * severity), history)
+            loads[:, :, :3] *= (1 - ramp)[None, :, None]
+            loads[:, :, 3] += 8 * ramp
+        capacities = [[4, int(loads[c, -1, 1]), int(loads[c, -1, 2])] for c in range(computes)]
+        agent_compute = balanced_hosts(agents, computes, rng)
+        descriptions, skills, tools, knowledge, a_states, r_states = [], [], [], [], [], []
+        for i in range(agents):
+            source = self.types[i % len(self.types)]
+            skills.append(source["all_skills"])
+            tools.append(source["工具API权限"].split("|"))
+            kb = source["接入知识库"]
+            knowledge.append([] if kb == "无" else kb.split("|"))
+            descriptions.append(source["智能体能力描述"])
+            busy = rng.uniform(0, .4)
+
+            a_states.append(np.tile([source["上下文窗口总量(tokens)"], rng.uniform(.1, .7),
+                                     source["工具API速率限制(次/分钟)"], busy, source.get("simulation_profile",{}).get("speed",1.), source.get("simulation_profile",{}).get("proficiency",.9)], (history, 1)))
+
+            fail = rng.uniform(.01, .07)
+            trend = rng.uniform(-.025, .025) * np.linspace(0, 1, history)
+            if stress in ("tool", "combined"):
+
+                trend += np.linspace(0, .025 * severity, history)
+            failures = np.clip(fail + trend, .0002, .15)
+
+            r_states.append(np.stack([1 - failures, np.full(history, rng.uniform(2, 10)), failures * .6,
+                                      np.arange(history) + rng.integers(20, 200)], axis=-1))
+
+        links = [[i, agents + agent_compute[i]] for i in range(agents)]
+        links += [[i,j] for i in range(agents) for j in range(i+1,agents)]
+        e_states, bandwidth = [], []
+        for _ in links:
+            bw = int(rng.choice([100, 500, 1000, 2000]))
+            lat = rng.uniform(.002, .05)
+            loss = rng.uniform(.0001, .002)
+            drift = np.linspace(0, rng.uniform(-.1, .2), history)
+            if stress in ("link", "combined"):
+
+                drift += np.linspace(0, .6 * severity, history)
+
+            e_states.append(np.stack([lat * (1 + drift), np.full(history, bw),
+                                      np.maximum(0, loss + .008 * drift), lat * .1 * (1 + drift)], axis=-1))
+            bandwidth.append(bw)
+        states = {"A": rounded(a_states), "C": rounded(loads), "E": rounded(e_states), "R": rounded(r_states)}
+
+        snapshot = Snapshot(0.0, [float(i - history + 1) for i in range(history)], states,
+                            {g: [[False] * history for _ in values] for g, values in states.items()},
+                            skills, tools, knowledge, descriptions, agent_compute, capacities, links, bandwidth,
+                            [float(loads[c, -1, 3]) for c in agent_compute], revision=f"{split}-{seed}-{index}-{agents}-{stress}-{severity}")
+        snapshot.agent_profiles = [dict(self.types[i % len(self.types)].get("simulation_profile",{})) for i in range(agents)]
+
+        from .world import World
+        history_world=World(snapshot,seed_of(seed,split,index,"world"))
+        for agent in range(agents):
+            speed=snapshot.agent_profiles[agent].get("speed",1.)
+            for h,observed in enumerate(snapshot.observed_at):
+                tool_pressure=float(np.mean([max(0.,history_world.wave(("tool",tool),observed)) for tool in tools[agent]])) if tools[agent] else 0.
+                snapshot.states["R"][agent][h][2]=.10*tool_pressure
+                snapshot.states["R"][agent][h][1]=400/max(4,loads[agent_compute[agent],h,0]*speed)
+
+
+        choices = [t for t in self.partitions[split] if (scenario is None or t["场景"] == scenario)
+                   and (difficulty is None or t["难度级别"] == difficulty)]
+        if not choices:
+            raise ValueError("no source template for requested stratum")
+        examples = []
+        for b in range(batch):
+            source = choices[int(rng.integers(len(choices)))]
+            task_rows = source["子任务"]
+            tasks = []
+            for k, row in enumerate(task_rows):
+                skill = row["必需的Skill id"]
+                requirement=self.skill_requirements.get(skill,{"tools":[],"knowledge":[]})
+                required_tools=requirement["tools"]
+                required_kb=requirement["knowledge"]
+                tasks.append(Task(k, row["任务具体提示词"], skill, required_tools, required_kb,
+                                  float(rng.uniform(150, 800)), [1, int(rng.choice([4, 8, 16])), int(rng.choice([2, 4, 8]))]))
+
+            task_ids = {r["任务id"]: i for i, r in enumerate(task_rows)}
+            raw_edges = source["DAG"]["边"]
+            edges = []
+            for e in raw_edges:
+                if isinstance(e, dict):
+                    parent, child = e.get("source", e.get("from")), e.get("target", e.get("to"))
+                else:
+                    parent, child = e[:2]
+                if parent in task_ids and child in task_ids:
+                    edges.append([task_ids[parent], task_ids[child], float(rng.uniform(1, 40))])
+            if len(tasks) > 1 and not edges:
+                raise ValueError(f"unrecognized source DAG: {raw_edges}")
+            deadline = float({"简单": 80, "中等": 160, "困难": 240}[source["难度级别"]])
+            workflow = Workflow(f"{split}-{seed}-{index}-{b}", tasks, edges, 0, deadline, .9,
+                                source["场景"], source["难度级别"], source["任务id"])
+            provenance = {"split": split, "world_seed": seed_of(seed, split, index, "world")}
+            example = Example(snapshot, workflow, [], provenance)
+
+            example.observations = logging_policy(example)
+            examples.append(example)
+        return examples
+
+
+def logging_policy(example):
+    'Mix exploration policies; execute only causally ready tasks and selected transfers.'
+    from .world import World
+    s, w = example.inputs()
+    world = World(s, example.provenance["world_seed"])
+    rng = np.random.default_rng(seed_of(example.provenance["world_seed"], w.id, "logging"))
+    chosen, finished, logs = {}, {}, []
+    for task in w.tasks:
+
+        feasible = [i for i in s.feasible(task)
+                    if all(d <= c for d, c in zip(task.demand, s.capacities[s.agent_compute[i]]))]
+        if not feasible:
+            continue
+
+        speed = np.asarray([s.states["C"][s.agent_compute[i]][-1][0] for i in feasible])
+        rel = np.asarray([s.states["R"][i][-1][0] for i in feasible])
+        probability = np.full(len(feasible), .5 / len(feasible))
+        probability[int(speed.argmax())] += .25
+        probability[int(rel.argmax())] += .25
+        position = int(rng.choice(len(feasible), p=probability))
+        agent = feasible[position]
+        ready = max(s.available[agent], max((o.finished for o in logs),default=0))
+
+        parents = [(int(a), mb) for a, b, mb in w.edges if b == task.id]
+        if any(a not in finished for a, _ in parents):
+            continue
+        valid = True
+        for parent, mb in parents:
+            path = s.path(chosen[parent], agent)
+            if path is None:
+                valid = False
+                break
+            start = max(finished[parent], max((o.finished for o in logs),default=0))
+            duration, success = world.transfer(w, parent, task.id, chosen[parent], agent, mb, start, 0)
+            logs.append(Observation("edge", parent, chosen[parent], duration, success, start, start + duration,
+                                    0, float(probability[position]), task.id, agent, world.last_reason))
+            ready = max(ready, start + duration)
+            if not success:
+                return logs
+        if not valid:
+            continue
+
+        duration, success = world.execute(w, task.id, agent, ready, 0)
+        logs.append(Observation("node", task.id, agent, duration, success, ready, ready + duration,
+                                0, float(probability[position]), failure_reason=world.last_reason))
+        chosen[task.id] = agent
+        if success:
+            finished[task.id] = ready + duration
+        else:
+            return logs
+    return logs
